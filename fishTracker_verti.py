@@ -1,14 +1,14 @@
+import os
+import glob
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import csv
 from datetime import timedelta
-from matplotlib.colors import LinearSegmentedColormap
 from simple_log_helper import CustomLogger
-import os
-import glob
 from abc import ABC, abstractmethod
 import multiprocessing
+from utils.styleTransfer import style_transfer
 logger = CustomLogger(__name__, log_filename='Logs/fish_tracking.log')
 
 class AccelerationStrategy(ABC):
@@ -33,13 +33,36 @@ class FishTracker:
         self.display_scale = display_scale
         self.logger = logger or CustomLogger(__name__, log_filename='Logs/fish_tracking.log')
 
-    def transfer_rpg_to_hsv(self, rpg_image):
-        return cv2.cvtColor(rpg_image, cv2.COLOR_RGB2HSV)
+    def create_mask(self, image):
+        # 缓存转换后的图像格式，避免重复转换
+        if hasattr(self, '_last_image') and self._last_image is image:
+            return self._last_mask
+            
+        if isinstance(image, cv2.UMat):
+            image = image.get()
+        
+        # 使用更高效的颜色空间转换
+        if len(image.shape) == 2 or image.shape[2] == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-    def create_mask(self, hsv_image):
-        lower_bound = np.array([85, 20, 0])
-        upper_bound = np.array([120, 255, 170])
-        return cv2.inRange(hsv_image, lower_bound, upper_bound)
+        # 使用位运算优化边界检测
+        lower_bound = np.array([90, 140, 180])
+        upper_bound = np.array([200, 200, 255])
+        mask = cv2.inRange(image, lower_bound, upper_bound)
+
+        # 优化差分计算，使用Sobel算子替代
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient = np.sqrt(sobel_x**2 + sobel_y**2)
+        
+        # 应用阈值
+        mask[gradient < 10] = 0
+        
+        # 缓存结果
+        self._last_image = image
+        self._last_mask = mask
+        return mask
 
     def define_roi(self, image):
         symmetry_x, symmetry_y = 0, 0
@@ -53,45 +76,6 @@ class FishTracker:
 
     def distance(self, p1, p2):
         return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
-
-    def correct_fish_orientation(self, prev_heads, prev_tails, current_head, current_tail, rect, time):
-        if len(prev_heads) < 2 or len(prev_tails) < 2:
-            # 如果没有足够的历史数据，就使用当前的检测结果
-            return current_head, current_tail
-
-        prev_head = prev_heads[-1]
-        prev_tail = prev_tails[-1]
-        # 检查当前鱼的位置是否与上一帧的鱼重叠
-        current_rect = cv2.minAreaRect(np.array([current_head, current_tail]))
-        prev_rect = cv2.minAreaRect(np.array([prev_head, prev_tail]))
-        
-        if not self.rectangles_overlap(current_rect, prev_rect):
-            self.logger.info(f"鱼的位置在帧 {time} 发生了跳变，视为新的鱼")
-            return current_head, current_tail
-        
-        # 计算前一帧的运动向量
-        prev_direction = np.array(prev_head) - np.array(prev_tail)
-        
-        # 计算当前帧的两个可能的运动向量
-        current_direction1 = np.array(current_head) - np.array(current_tail)
-        current_direction2 = np.array(current_tail) - np.array(current_head)
-        
-        # 计算与前一帧运动向量的夹角
-        angle1 = self.angle_between(prev_direction, current_direction1)
-        angle2 = self.angle_between(prev_direction, current_direction2)
-        
-        # 如果第二个方向与前一帧的方向更接近（夹角更小），则交换头尾
-        if angle2 < angle1:
-            self.logger.info(f"交换头尾 {time}, 基于运动方向")
-            return current_tail, current_head
-        
-        return current_head, current_tail
-
-    def angle_between(self, v1, v2):
-        # 计算两个向量之间的夹角（以度为单位）
-        v1_u = v1 / np.linalg.norm(v1)
-        v2_u = v2 / np.linalg.norm(v2)
-        return np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0)) * 180 / np.pi
 
     def rectangles_overlap(self, rect1, rect2):
         # 将旋转矩形转换为轴对齐的边界框
@@ -108,30 +92,32 @@ class FishTracker:
         return not (max1[0] < min2[0] or min1[0] > max2[0] or
                     max1[1] < min2[1] or min1[1] > max2[1])
     def find_fish_features(self, mask):
+        # 使用更高效的轮廓检测方法
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
             return None
+            
+        # 使用numpy操作替代列表解析，提高性能
+        areas = np.array([cv2.contourArea(c) for c in contours])
+        valid_mask = (areas > 5) & (areas < mask.shape[0] * mask.shape[1] / 2)
+        valid_contours = [c for i, c in enumerate(contours) if valid_mask[i]]
         
-        fish_contour = max(contours, key=cv2.contourArea)
+        if not valid_contours:
+            return None
+            
+        fish_contour = max(valid_contours, key=cv2.contourArea)
         
+        # 一次性计算所需的特征
         rect = cv2.minAreaRect(fish_contour)
-        box = cv2.boxPoints(rect)
-        box = np.int0(box)
+        box = np.int0(cv2.boxPoints(rect))
+        M = cv2.moments(fish_contour)
         
-        moments = cv2.moments(fish_contour)
-        centroid_x = int(moments['m10'] / moments['m00'])
-        centroid_y = int(moments['m01'] / moments['m00'])
-        centroid = (centroid_x, centroid_y)
-
-        distances = np.sqrt(((fish_contour - centroid) ** 2).sum(axis=2))
-        farthest_point = tuple(fish_contour[distances.argmax()][0])
-
-        distances_from_tail = np.sqrt(((fish_contour - farthest_point) ** 2).sum(axis=2))
-        head = tuple(fish_contour[distances_from_tail.argmax()][0])
-        tail = tuple(fish_contour[distances_from_tail.argmin()][0])
-
-        return box, head, tail, rect
+        if M['m00'] == 0:
+            return None
+            
+        centroid = (int(M['m10'] / M['m00']), int(M['m01'] / M['m00']))
+        return box, centroid, rect
 
     def process_video(self, video_path, output_dir, frame_interval=1, show_video=False, logger=None):
         if logger:
@@ -140,65 +126,74 @@ class FishTracker:
         cap = cv2.VideoCapture(video_path)
         
         if not cap.isOpened():
-            logger.info(f"Error opening video file: {video_path}")
+            self.logger.info(f"Error opening video file: {video_path}")
             return
         
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        logger.info(f"Processing video: {video_path}")
-        logger.info(f"Video size: {width}x{height}")
-        logger.info(f"Total frames: {frame_count}")
-        logger.info(f"FPS: {fps}")
+        # 修改缩放逻辑，直接缩放到目标分辨率
+        target_width, target_height = 1000, 600
+        scale_x = target_width / original_width
+        scale_y = target_height / original_height
+        scale = min(scale_x, scale_y)
+        
+        width = int(original_width * scale)
+        height = int(original_height * scale)
+        
+        self.logger.info(f"Processing video: {video_path}")
+        self.logger.info(f"Original video size: {original_width}x{original_height}")
+        self.logger.info(f"Scaled video size: {width}x{height}")
+        self.logger.info(f"Total frames: {frame_count}")
+        self.logger.info(f"FPS: {fps}")
 
         output_video = os.path.join(output_dir, os.path.basename(video_path).replace('.mov', '_output.mp4'))
         output_csv = os.path.join(output_dir, os.path.basename(video_path).replace('.mov', '_data.csv'))
-        output_heatmap = os.path.join(output_dir, os.path.basename(video_path).replace('.mov', '_heatmap.png'))
-
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+        # Use the scaled dimensions for the output video
         out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
         
-        head_positions = []
-        tail_positions = []
+        centroids = []
         fish_data = []
         detected_fish_count = 0
         processed_frame_count = 0
         
         while cap.isOpened():
+            # Skip frames according to frame_interval
+            cap.set(cv2.CAP_PROP_POS_FRAMES, processed_frame_count * frame_interval)
             ret, frame = cap.read()
             if not ret:
                 break
             
             processed_frame_count += 1
-            if processed_frame_count % frame_interval != 0:
-                continue
 
+            # Scale the frame to 1/3 of its original size
+            frame = cv2.resize(frame, (width, height))
             frame = self.acceleration_strategy.process_frame(frame)
-            hsv_image = self.transfer_rpg_to_hsv(frame)
-            mask = self.create_mask(hsv_image)
-            roi_mask = self.define_roi(frame)
-            mask = cv2.bitwise_and(mask, roi_mask)
+            mask = self.create_mask(frame)
+            # gray_image = style_transfer(frame)
+            #save grag image as png
+            # cv2.imwrite('Logs/gray_image.png', frame)
+            # _, mask = cv2.threshold(frame, 140, 180, cv2.THRESH_BINARY)
             
             result = self.find_fish_features(mask.get() if isinstance(mask, cv2.UMat) else mask)
-
+            # print(result)
             if result is not None:
-                box, head, tail, rect = result
+                box, centroid, rect = result
                 time = timedelta(seconds=processed_frame_count/fps)
-                corrected_head, corrected_tail = self.correct_fish_orientation(head_positions, tail_positions, head, tail, rect, time)
                 
                 detected_fish_count += 1
-                head_positions.append(corrected_head)
-                tail_positions.append(corrected_tail)
+                centroids.append(centroid)
                 
-                fish_data.append([time, corrected_head[0], corrected_head[1], rect[0][0], rect[0][1], rect[1][0], rect[1][1], rect[2]])
+                fish_data.append([time, centroid[0], centroid[1], rect[0][0], rect[0][1], rect[1][0], rect[1][1], rect[2]])
                 
                 cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
-                cv2.circle(frame, corrected_head, 5, (0, 0, 255), -1)
-                cv2.circle(frame, corrected_tail, 5, (255, 0, 0), -1)
+                cv2.circle(frame, centroid, 5, (0, 0, 255), -1)
                 
-                recent_positions = head_positions[-100:]
+                recent_positions = centroids[-100:]
                 for i in range(1, len(recent_positions)):
                     cv2.line(frame, recent_positions[i-1], recent_positions[i], (0, 255, 255), 1)
                 cv2.putText(frame, str(time), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -209,7 +204,7 @@ class FishTracker:
                     cv2.imshow('Fish Tracking', display_frame)
 
             if processed_frame_count % 100 == 0:
-                logger.info(f"Processed {processed_frame_count}/{frame_count} frames")
+                self.logger.info(f"Processed {processed_frame_count}/{frame_count} frames")
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -218,58 +213,22 @@ class FishTracker:
         out.release()
         cv2.destroyAllWindows()
         
-        logger.info(f"Detected fish in {detected_fish_count} frames")
-        logger.info(f"Total processed frames: {processed_frame_count}")
-        logger.info(f"Output video saved to: {output_video}")
+        self.logger.info(f"Detected fish in {detected_fish_count} frames")
+        self.logger.info(f"Total processed frames: {processed_frame_count}")
+        self.logger.info(f"Output video saved to: {output_video}")
 
-        if head_positions:
+        if centroids:
             self.save_to_csv(fish_data, output_csv)
-            self.plot_trajectory_heatmap(head_positions, (width, height), output_heatmap)
-            logger.info(f"Processing completed successfully for {video_path}")
-            logger.info(f"CSV data saved to: {output_csv}")
-            logger.info(f"Heatmap saved to: {output_heatmap}")
+            self.logger.info(f"Processing completed successfully for {video_path}")
+            self.logger.info(f"CSV data saved to: {output_csv}")
         else:
-            logger.warning(f"No fish detected in the video: {video_path}")
+            self.logger.warning(f"No fish detected in the video: {video_path}")
 
     def save_to_csv(self, fish_data, output_file):
         with open(output_file, 'w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["Time", "Head_X", "Head_Y", "Rect_Center_X", "Rect_Center_Y", "Rect_Width", "Rect_Height", "Rect_Angle"])
+            writer.writerow(["Time", "Centroid_X", "Centroid_Y", "Rect_Center_X", "Rect_Center_Y", "Rect_Width", "Rect_Height", "Rect_Angle"])
             writer.writerows(fish_data)
-
-    def plot_trajectory_heatmap(self, head_positions, frame_shape, output_file='fish_trajectory_heatmap.png'):
-        # 创建图像
-        plt.figure(figsize=(10, 10))
-        
-        # 绘制轨迹
-        x = [pos[0] for pos in head_positions]
-        y = [pos[1] for pos in head_positions]
-        plt.plot(x, y, color='white', linewidth=0.5, alpha=0.7)
-        
-        # 创建热力图数据
-        heatmap, xedges, yedges = np.histogram2d(x, y, bins=50, range=[[0, frame_shape[1]], [0, frame_shape[0]]])
-        
-        # 创建自定义颜色映射
-        colors = ['darkblue', 'blue', 'lightblue', 'green', 'yellow', 'red']
-        n_bins = 100
-        cmap = LinearSegmentedColormap.from_list('custom', colors, N=n_bins)
-        
-        # 绘制热力图
-        plt.imshow(heatmap.T, extent=[0, frame_shape[1], frame_shape[0], 0], 
-                   cmap=cmap, alpha=0.7, interpolation='gaussian')
-        
-        # 设置坐标轴
-        plt.xlim(0, frame_shape[1])
-        plt.ylim(frame_shape[0], 0)  # 反转Y轴以匹配图像坐标系
-        plt.axis('off')  # 隐藏坐标轴
-        
-        # 添加 'S' 和 'F' 标签
-        plt.text(0.05, 0.5, 'S', fontsize=20, color='white', transform=plt.gca().transAxes)
-        plt.text(0.95, 0.5, 'F', fontsize=20, color='white', transform=plt.gca().transAxes)
-        
-        plt.tight_layout()
-        plt.savefig(output_file, dpi=300, bbox_inches='tight', facecolor='gray')
-        plt.close()
 
 def process_video_wrapper(args):
     video_file, output_dir, frame_interval, show_video, use_gpu = args
@@ -313,7 +272,14 @@ if __name__ == "__main__":
 
     # process_videos(args.input_dir, args.output_dir, args.frame_interval, args.show_video, args.max_workers, args.use_gpu)
     max_workers = multiprocessing.cpu_count()
+    max_workers = 1
     # process_videos('data/hori', 'output/hori', 1, False, max_workers, False)
     process_videos('data/fix', 'output/fix', 1, False, max_workers, False)
+    # tracker = FishTracker(OpenCLAcceleration(), display_scale=0.5)
+    # tracker.process_video('data/fix/IMG_4251.mov', 'output/fix', 1000, True, CustomLogger(__name__, log_filename='Logs/fish_tracking.log'))
+
     # fish_tracker = FishTracker(OpenCLAcceleration(), display_scale=0.5)
     # fish_tracker.process_video('data/IMG_4219.mov', 'output', 1, True)
+
+
+

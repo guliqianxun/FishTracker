@@ -6,9 +6,12 @@ from datetime import timedelta
 from matplotlib.colors import LinearSegmentedColormap
 from simple_log_helper import CustomLogger
 import os
+import argparse
+import concurrent.futures
 import glob
 from abc import ABC, abstractmethod
 import multiprocessing
+
 logger = CustomLogger(__name__, log_filename='Logs/fish_tracking.log')
 
 class AccelerationStrategy(ABC):
@@ -32,6 +35,9 @@ class FishTracker:
         self.acceleration_strategy = acceleration_strategy
         self.display_scale = display_scale
         self.logger = logger or CustomLogger(__name__, log_filename='Logs/fish_tracking.log')
+        self.background_subtractor = cv2.createBackgroundSubtractorMOG2(history=2000, varThreshold=16, detectShadows=False)
+        self.background = None
+        self.frame_count = 0
 
     def transfer_rpg_to_hsv(self, rpg_image):
         return cv2.cvtColor(rpg_image, cv2.COLOR_RGB2HSV)
@@ -124,14 +130,28 @@ class FishTracker:
         centroid_y = int(moments['m01'] / moments['m00'])
         centroid = (centroid_x, centroid_y)
 
-        distances = np.sqrt(((fish_contour - centroid) ** 2).sum(axis=2))
-        farthest_point = tuple(fish_contour[distances.argmax()][0])
+        # Return only the box and centroid
+        return box, centroid, rect
 
-        distances_from_tail = np.sqrt(((fish_contour - farthest_point) ** 2).sum(axis=2))
-        head = tuple(fish_contour[distances_from_tail.argmax()][0])
-        tail = tuple(fish_contour[distances_from_tail.argmin()][0])
-
-        return box, head, tail, rect
+    def detect_fish(self, frame):
+        self.frame_count += 1
+        
+        # Apply background subtraction
+        fg_mask = self.background_subtractor.apply(frame)
+        
+        # Apply some morphological operations to remove noise and fill holes
+        kernel = np.ones((5,5), np.uint8)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Threshold the mask to get binary image
+        _, mask = cv2.threshold(fg_mask, 244, 255, cv2.THRESH_BINARY)
+        
+        # Apply ROI mask
+        roi_mask = self.define_roi(frame)
+        mask = cv2.bitwise_and(mask, roi_mask)
+        
+        return mask
 
     def process_video(self, video_path, output_dir, frame_interval=1, show_video=False, logger=None):
         if logger:
@@ -161,7 +181,6 @@ class FishTracker:
         out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
         
         head_positions = []
-        tail_positions = []
         fish_data = []
         detected_fish_count = 0
         processed_frame_count = 0
@@ -176,27 +195,23 @@ class FishTracker:
                 continue
 
             frame = self.acceleration_strategy.process_frame(frame)
-            hsv_image = self.transfer_rpg_to_hsv(frame)
-            mask = self.create_mask(hsv_image)
-            roi_mask = self.define_roi(frame)
-            mask = cv2.bitwise_and(mask, roi_mask)
+            
+            # Use the new detect_fish method
+            mask = self.detect_fish(frame)
             
             result = self.find_fish_features(mask.get() if isinstance(mask, cv2.UMat) else mask)
 
             if result is not None:
-                box, head, tail, rect = result
+                box, centroid, rect = result
                 time = timedelta(seconds=processed_frame_count/fps)
-                corrected_head, corrected_tail = self.correct_fish_orientation(head_positions, tail_positions, head, tail, rect, time)
                 
                 detected_fish_count += 1
-                head_positions.append(corrected_head)
-                tail_positions.append(corrected_tail)
+                head_positions.append(centroid)  # Now storing centroid positions
                 
-                fish_data.append([time, corrected_head[0], corrected_head[1], rect[0][0], rect[0][1], rect[1][0], rect[1][1], rect[2]])
+                fish_data.append([time, centroid[0], centroid[1], rect[0][0], rect[0][1], rect[1][0], rect[1][1], rect[2]])
                 
                 cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
-                cv2.circle(frame, corrected_head, 5, (0, 0, 255), -1)
-                cv2.circle(frame, corrected_tail, 5, (255, 0, 0), -1)
+                cv2.circle(frame, centroid, 5, (0, 0, 255), -1)
                 
                 recent_positions = head_positions[-100:]
                 for i in range(1, len(recent_positions)):
@@ -288,12 +303,8 @@ def process_videos(input_dir, output_dir, frame_interval, show_video=False, max_
     os.makedirs(output_dir, exist_ok=True)
     video_files = glob.glob(os.path.join(input_dir, '*.mov'))
     
-    # Debug: Check the number of video files found
     logger.info(f"Found {len(video_files)} video files to process")
-    if len(video_files) == 0:
-        logger.warning("No video files found in the input directory.")
-        return
-
+    
     with multiprocessing.Pool(processes=max_workers) as pool:
         args_list = [(video_file, output_dir, frame_interval, show_video, use_gpu) for video_file in video_files]
         pool.map(process_video_wrapper, args_list)
@@ -314,6 +325,6 @@ if __name__ == "__main__":
     # process_videos(args.input_dir, args.output_dir, args.frame_interval, args.show_video, args.max_workers, args.use_gpu)
     max_workers = multiprocessing.cpu_count()
     # process_videos('data/hori', 'output/hori', 1, False, max_workers, False)
-    process_videos('data/fix', 'output/fix', 1, False, max_workers, False)
+    process_videos('data/verti', 'output/verti', 1, False, max_workers, False)
     # fish_tracker = FishTracker(OpenCLAcceleration(), display_scale=0.5)
     # fish_tracker.process_video('data/IMG_4219.mov', 'output', 1, True)
