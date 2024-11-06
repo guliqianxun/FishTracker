@@ -31,6 +31,6 @@ def sample_video(input_path, output_dir, sample_rate=1000):
     print(f"Sampled {sample_count} frames from {total_frames} total frames.")
 
 # Usage
-input_video = "data/fix/IMG_4242.mov"
+input_video = "data/fix/IMG_4252.mp4"
 output_directory = "data/test"
 sample_video(input_video, output_directory)

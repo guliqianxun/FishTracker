@@ -8,7 +8,7 @@ from datetime import timedelta
 from simple_log_helper import CustomLogger
 from abc import ABC, abstractmethod
 import multiprocessing
-from utils.styleTransfer import style_transfer
+# from utils.styleTransfer import style_transfer
 logger = CustomLogger(__name__, log_filename='Logs/fish_tracking.log')
 
 class AccelerationStrategy(ABC):
@@ -45,10 +45,12 @@ class FishTracker:
         if len(image.shape) == 2 or image.shape[2] == 1:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-        # 使用位运算优化边界检测
-        lower_bound = np.array([90, 140, 180])
-        upper_bound = np.array([200, 200, 255])
+        # 使用位运算优化边界检测 # 创建掩码过滤三个通道值都在180附近的像素点
+        mask_180 = cv2.inRange(image, np.array([175, 175, 175]), np.array([185, 185, 185]))
+        lower_bound = np.array([120, 140, 180])
+        upper_bound = np.array([200, 230, 255])
         mask = cv2.inRange(image, lower_bound, upper_bound)
+        mask = cv2.bitwise_and(mask, ~mask_180)
 
         # 优化差分计算，使用Sobel算子替代
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -271,12 +273,12 @@ if __name__ == "__main__":
     # args = parser.parse_args()
 
     # process_videos(args.input_dir, args.output_dir, args.frame_interval, args.show_video, args.max_workers, args.use_gpu)
-    max_workers = multiprocessing.cpu_count()
-    max_workers = 1
-    # process_videos('data/hori', 'output/hori', 1, False, max_workers, False)
-    process_videos('data/fix', 'output/fix', 1, False, max_workers, False)
-    # tracker = FishTracker(OpenCLAcceleration(), display_scale=0.5)
-    # tracker.process_video('data/fix/IMG_4251.mov', 'output/fix', 1000, True, CustomLogger(__name__, log_filename='Logs/fish_tracking.log'))
+    # max_workers = multiprocessing.cpu_count()
+    # max_workers = 1
+    # # process_videos('data/hori', 'output/hori', 1, False, max_workers, False)
+    # process_videos('data/fix', 'output/fix', 1, False, max_workers, False)
+    tracker = FishTracker(OpenCLAcceleration(), display_scale=0.5)
+    tracker.process_video('data/verti/IMG_4252.mov', 'output/fix', 1, True, CustomLogger(__name__, log_filename='Logs/fish_tracking.log'))
 
     # fish_tracker = FishTracker(OpenCLAcceleration(), display_scale=0.5)
     # fish_tracker.process_video('data/IMG_4219.mov', 'output', 1, True)
